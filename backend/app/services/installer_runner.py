@@ -133,8 +133,7 @@ def _store_kubeadmin_password_from_file(
     ssh: paramiko.SSHClient,
     cluster_name: str,
     base_dir: str,
-    cluster_dir: str,
-) -> None:
+    cluster_dir: str,) -> None:
     with job.kv_lock:
         if job.kv_saved:
             return

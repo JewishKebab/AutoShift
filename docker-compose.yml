@@ -1,0 +1,31 @@
+services:
+  backend:
+    image: autoshift-backend:latest
+    container_name: backend
+    env_file:
+      - ./backend/.env
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+
+  frontend:
+    image: autoshift-frontend:latest
+    container_name: frontend
+    env_file:
+      - ./frontend/.env
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+    # Mount certs from the VM into container
+    volumes:
+      - /etc/autoshift/ssl/fullchain.crt:/etc/nginx/ssl/fullchain.crt:ro
+      - /etc/autoshift/ssl/privkey.key:/etc/nginx/ssl/privkey.key:ro
+
+      # OPTIONAL (recommended): mount nginx config from VM so no rebuild needed
+      # Put the nginx file on VM at ./frontend/nginx/default.conf (example path)
+      - ./frontend/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+

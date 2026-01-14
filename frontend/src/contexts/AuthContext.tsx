@@ -1,4 +1,10 @@
-import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
+import React, {
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 
 type User = {
   name: string;
@@ -18,23 +24,60 @@ type AuthContextType = {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:5000";
+/**
+ * No config.js. No hardcoded backend host.
+ * Single source of truth: API is always same-origin under /api
+ *
+ * - Local dev: Vite proxy forwards /api -> http://localhost:5000
+ * - VM/prod: Nginx forwards /api -> backend container
+ */
+function buildApiUrl(path: string) {
+  const p = path.startsWith("/") ? path : `/${path}`;
+  return `/api${p}`;
+}
 
-async function apiGet<T>(path: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: "GET",
+async function apiRequest<T>(
+  method: "GET" | "POST",
+  path: string,
+  body?: unknown
+): Promise<T> {
+  const res = await fetch(buildApiUrl(path), {
+    method,
     credentials: "include", // IMPORTANT: cookie auth
-    headers: { "Accept": "application/json" },
+    headers: {
+      Accept: "application/json",
+      ...(method === "POST" ? { "Content-Type": "application/json" } : {}),
+    },
+    body: method === "POST" ? JSON.stringify(body ?? {}) : undefined,
   });
 
-  // If backend redirects (rare here), browser will follow automatically
   const contentType = res.headers.get("content-type") || "";
-  const data = contentType.includes("application/json") ? await res.json() : null;
+  const raw = await res.text();
+
+  let data: any = null;
+  if (contentType.includes("application/json") && raw) {
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      data = null;
+    }
+  }
 
   if (!res.ok) {
-    const msg = (data && (data.error || data.message)) || `Request failed (${res.status})`;
+    const msg =
+      (data && (data.error || data.message)) ||
+      raw ||
+      `Request failed (${res.status})`;
     throw new Error(msg);
   }
+
+  // Fail loudly if backend didn't return JSON (helps debug nginx/html responses)
+  if (!data) {
+    throw new Error(
+      `Expected JSON but got ${contentType || "unknown content-type"}`
+    );
+  }
+
   return data as T;
 }
 
@@ -46,8 +89,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const refreshIdentity = async () => {
     try {
-      // You should implement /api/identity on the backend (jwt_required)
-      const me = await apiGet<User>("/api/identity");
+      // Backend should implement /api/identity (jwt_required)
+      const me = await apiRequest<User>("GET", "/identity");
       setUser(me);
     } catch {
       setUser(null);
@@ -57,7 +100,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const login = async () => {
     setIsLoading(true);
     try {
-      const data = await apiGet<{ auth_url: string }>("/api/login/azure");
+      const data = await apiRequest<{ auth_url: string }>("GET", "/login/azure");
       // Full-page redirect into Azure login flow
       window.location.href = data.auth_url;
     } finally {
@@ -69,18 +112,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const logout = async () => {
     setIsLoading(true);
     try {
-      await fetch(`${import.meta.env.VITE_API_BASE || "http://localhost:5000"}/api/logout`, {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-      });
+      await apiRequest("POST", "/logout", {});
+    } catch {
+      // Even if logout fails, clear local state and continue
     } finally {
       setUser(null);
       setIsLoading(false);
       window.location.href = "/login";
     }
-};
-
+  };
 
   useEffect(() => {
     // On app load, try to discover current session (JWT cookies)
@@ -104,3 +144,4 @@ export function useAuth() {
   if (!ctx) throw new Error("useAuth must be used within AuthProvider");
   return ctx;
 }
+

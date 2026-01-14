@@ -1,9 +1,12 @@
+import os
 import msal
 from datetime import timedelta
-from flask import Blueprint, current_app, jsonify, redirect, request, make_response
+from flask import Blueprint, jsonify, redirect, request, make_response, current_app
 from flask_jwt_extended import (
-    create_access_token, create_refresh_token,
-    set_access_cookies, set_refresh_cookies
+    create_access_token,
+    create_refresh_token,
+    set_access_cookies,
+    set_refresh_cookies,
 )
 from app.auth.azure_config import AzureConfig
 
@@ -15,10 +18,23 @@ REQUIRED_AZURE_ROLE = "User"
 
 
 def map_azure_role_to_app_role(azure_roles: list[str]) -> str:
-    # Optional: your internal app role mapping
     if REQUIRED_AZURE_ROLE in azure_roles:
         return "user"
     return "guest"
+
+
+def get_frontend_url() -> str:
+    """
+    Resolve frontend URL from environment.
+    Falls back to localhost for dev.
+    Always returns a clean, non-empty URL.
+    """
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:8080").strip()
+
+    if not frontend_url:
+        raise RuntimeError("FRONTEND_URL environment variable is not set")
+
+    return frontend_url.rstrip("/")
 
 
 @bp.get("/login/azure")
@@ -33,6 +49,7 @@ def azure_login():
         scopes=azure_config.SCOPE,
         redirect_uri=azure_config.REDIRECT_URI,
     )
+
     return jsonify({"auth_url": auth_url}), 200
 
 
@@ -40,14 +57,20 @@ def azure_login():
 def azure_callback():
     # Azure returned an error
     if "error" in request.args:
-        return jsonify({
-            "ok": False,
-            "error": request.args.get("error_description", "Azure auth failed")
-        }), 400
+        return jsonify(
+            {
+                "ok": False,
+                "error": request.args.get(
+                    "error_description", "Azure auth failed"
+                ),
+            }
+        ), 400
 
     code = request.args.get("code")
     if not code:
-        return jsonify({"ok": False, "error": "No authorization code provided"}), 400
+        return jsonify(
+            {"ok": False, "error": "No authorization code provided"}
+        ), 400
 
     msal_app = msal.ConfidentialClientApplication(
         azure_config.CLIENT_ID,
@@ -61,12 +84,20 @@ def azure_callback():
         redirect_uri=azure_config.REDIRECT_URI,
     )
 
-    # If token acquisition failed, MSAL returns {"error": "...", "error_description": "..."}
-    if not token_response or "error" in token_response:
-        return jsonify({
-            "ok": False,
-            "error": token_response.get("error_description", "Failed to acquire token from Azure")
-        }), 400
+    if not token_response:
+        return jsonify(
+            {"ok": False, "error": "Failed to acquire token from Azure"}
+        ), 400
+
+    if "error" in token_response:
+        return jsonify(
+            {
+                "ok": False,
+                "error": token_response.get("error_description")
+                or token_response.get("error")
+                or "Failed to acquire token from Azure",
+            }
+        ), 400
 
     claims = token_response.get("id_token_claims") or {}
     user_id = claims.get("oid") or claims.get("sub")
@@ -74,15 +105,16 @@ def azure_callback():
     name = claims.get("name", "")
     azure_roles = claims.get("roles", []) or []
 
-    frontend_url = current_app.config.get("FRONTEND_URL", "http://localhost:8080")
+    frontend_url = get_frontend_url()
 
-    #  HARD GATE: must have the User app role, otherwise no access at all
+    # HARD GATE: must have the User app role
     if REQUIRED_AZURE_ROLE not in azure_roles:
         current_app.logger.warning(
             "Blocked login: missing required role '%s' for user '%s'. roles=%s",
-            REQUIRED_AZURE_ROLE, email or user_id, azure_roles
+            REQUIRED_AZURE_ROLE,
+            email or user_id,
+            azure_roles,
         )
-        # No cookies are set. User is redirected to an unauthorized page.
         return redirect(f"{frontend_url}/unauthorized")
 
     app_role = map_azure_role_to_app_role(azure_roles)
@@ -110,3 +142,4 @@ def azure_callback():
     set_access_cookies(response, access_jwt)
     set_refresh_cookies(response, refresh_jwt)
     return response
+
