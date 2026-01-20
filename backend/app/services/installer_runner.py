@@ -10,10 +10,11 @@ from typing import Dict, Optional, List, Tuple
 
 from app.services.private_dns_links import link_private_dns_zone_to_hubs
 from app.services.key_vault import store_kubeadmin_password
+from app.services.certificates import create_cluster_certificates
 
 MAX_LOG_LINES = 20000  # keep last N lines per job (in memory)
 
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")  # strips terminal color codes
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def strip_ansi(s: str) -> str:
@@ -23,6 +24,7 @@ def strip_ansi(s: str) -> str:
 @dataclass
 class Job:
     id: str
+    cluster_name: str  # IMPORTANT: used by /api/installer/certs/<job_id>
     done: bool = False
     exit_code: Optional[int] = None
     error: Optional[str] = None
@@ -53,10 +55,12 @@ _jobs: Dict[str, Job] = {}
 
 def start_install_job(cluster_name: str) -> Job:
     job_id = str(uuid.uuid4())
-    job = Job(id=job_id)
+    base = _normalize_cluster_name(cluster_name)
+    job = Job(id=job_id, cluster_name=base)
     _jobs[job_id] = job
-    threading.Thread(target=_run_install, args=(job, cluster_name), daemon=True).start()
+    threading.Thread(target=_run_install, args=(job, base), daemon=True).start()
     return job
+
 
 
 def get_job(job_id: str) -> Optional[Job]:
@@ -85,18 +89,11 @@ def _start_dns_watcher_if_needed(job: Job, cluster_name: str, reason: str) -> No
 
 
 def _normalize_cluster_name(name: str) -> str:
-    """
-    Your UI sometimes passes cluster_name like 'testing44-openshift'.
-    We normalize to a base name so we don't generate:
-      az-testing44-openshift-openshift-cluster
-    """
     s = (name or "").strip()
 
-    # If someone accidentally double-suffixed, collapse it.
     while s.endswith("-openshift-openshift"):
         s = s[: -len("-openshift")]
 
-    # Strip exactly one '-openshift' suffix
     if s.endswith("-openshift"):
         s = s[: -len("-openshift")]
 
@@ -104,15 +101,12 @@ def _normalize_cluster_name(name: str) -> str:
 
 
 def _cluster_dir_name(raw_cluster_name: str) -> str:
-    """
-    Canonical convention: az-<base>-openshift-cluster
-    """
     base = _normalize_cluster_name(raw_cluster_name)
-    return f"az-{base}-openshift-cluster"
+    return f"az-{base}-cluster"
 
 
 def _exec(ssh: paramiko.SSHClient, cmd: str, *, timeout: int = 60) -> Tuple[int, str, str]:
-    stdin, stdout, stderr = ssh.exec_command(cmd, get_pty=False, timeout=timeout)
+    _, stdout, stderr = ssh.exec_command(cmd, get_pty=False, timeout=timeout)
     out = stdout.read().decode("utf-8", errors="ignore")
     err = stderr.read().decode("utf-8", errors="ignore")
     rc = stdout.channel.recv_exit_status()
@@ -133,7 +127,8 @@ def _store_kubeadmin_password_from_file(
     ssh: paramiko.SSHClient,
     cluster_name: str,
     base_dir: str,
-    cluster_dir: str,) -> None:
+    cluster_dir: str,
+) -> None:
     with job.kv_lock:
         if job.kv_saved:
             return
@@ -168,7 +163,7 @@ def _store_kubeadmin_password_from_file(
 def _run_install(job: Job, cluster_name: str) -> None:
     host = os.environ["INSTALLER_VM_HOST"]
     user = os.environ.get("INSTALLER_VM_USER", "asgard")
-    ssh_password = os.environ["INSTALLER_VM_PASSWORD"]  # only for SSH login
+    ssh_password = os.environ["INSTALLER_VM_PASSWORD"]
 
     base_dir = os.environ.get("INSTALLER_BASE_DIR", "/home/devops")
     installer_path = os.environ.get("INSTALLER_OPENSHIFT_INSTALL_PATH", "/home/devops/openshift-install")
@@ -194,12 +189,10 @@ def _run_install(job: Job, cluster_name: str) -> None:
             timeout=15,
         )
 
-        # ensure sudo is NOPASSWD (prevents the whole password-echo/typing problem)
         rc, _, err = _exec(ssh, "sudo -n true", timeout=20)
         if rc != 0:
             raise RuntimeError(f"Installer VM sudo is not NOPASSWD (sudo -n true failed): {(err or '').strip()}")
 
-        # fail fast if install-config doesn't exist -> avoids interactive wizard
         rc, _, _ = _exec(ssh, f"sudo -n test -f {_sh_quote(install_cfg)}", timeout=20)
         if rc != 0:
             raise RuntimeError(
@@ -207,7 +200,6 @@ def _run_install(job: Job, cluster_name: str) -> None:
                 f"Push install-config first (or ensure naming matches)."
             )
 
-        # stream logs with PTY, but no password is ever sent (sudo -n)
         sudo_cmd = f"sudo -n bash -lc {_sh_quote(cmd)}"
         _, stdout, stderr = ssh.exec_command(sudo_cmd, get_pty=True)
 
@@ -231,22 +223,41 @@ def _run_install(job: Job, cluster_name: str) -> None:
         job.done = True
         job.append(f"[done] exit_code={rc}")
 
-        if rc == 0:
-            _store_kubeadmin_password_from_file(
-                job,
+        if rc != 0:
+            job.error = f"install failed (exit_code={rc})"
+            return
+
+        _store_kubeadmin_password_from_file(
+            job,
+            ssh=ssh,
+            cluster_name=cluster_name,
+            base_dir=base_dir,
+            cluster_dir=dir_name,
+        )
+
+        try:
+            job.append("[cert] starting certificate configuration...")
+            ok = create_cluster_certificates(
+                job.append,
                 ssh=ssh,
                 cluster_name=cluster_name,
                 base_dir=base_dir,
                 cluster_dir=dir_name,
             )
+            if ok:
+                job.append(f"[cert] download available: /api/installer/certs/{job.id}")
+            else:
+                job.append("[cert] certificate generation skipped/failed")
+        except Exception as e:
+            job.append(f"[cert][warn] certificate step failed: {e}")
 
-        _start_dns_watcher_if_needed(job, cluster_name, reason="fallback at install end")
+        if not job.dns_started:
+            _start_dns_watcher_if_needed(job, cluster_name, reason="fallback (trigger phrase not seen)")
 
     except Exception as e:
         job.error = str(e)
         job.done = True
         job.append(f"[error] {e}")
-        _start_dns_watcher_if_needed(job, cluster_name, reason="fallback after installer error")
 
     finally:
         try:

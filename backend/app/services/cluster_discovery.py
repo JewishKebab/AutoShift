@@ -9,15 +9,10 @@ from azure.identity import ClientSecretCredential
 from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.privatedns import PrivateDnsManagementClient
 
-#  Strict RG pattern:
+# Strict RG pattern:
 # - RG must be all lowercase (enforced in code)
 # - cluster name must contain "opensh" (so opensh/openshi/openshift all match)
 # - ends with "-<5 lowercase alnum>-rg"
-#
-# Examples:
-#   testing19-openshi-kw28x-rg
-#   testing20-openshift-kw28x-rg
-#   bsmch-prod-openshift-9ftcn-rg
 RG_RE = re.compile(r"^(?P<name>[a-z0-9-]*opensh[a-z0-9-]*)-(?P<infra>[a-z0-9]{5})-rg$")
 
 
@@ -32,6 +27,10 @@ class DiscoveredCluster:
     dns_zone: str
     dns_zone_found: bool
 
+    # NEW: cert bundle presence on installer VM
+    cert_zip_found: bool = False
+    cert_zip_path: str = ""
+
     def to_dict(self) -> Dict:
         return {
             "id": self.id,
@@ -42,6 +41,8 @@ class DiscoveredCluster:
             "status": self.status,
             "dnsZone": self.dns_zone,
             "dnsZoneFound": self.dns_zone_found,
+            "certZipFound": self.cert_zip_found,
+            "certZipPath": self.cert_zip_path,
         }
 
 
@@ -124,7 +125,6 @@ def _installer_processes_cached(ttl_seconds: int = 10) -> str:
     if data and (now - ts) < ttl_seconds:
         return data
 
-    # allow running without SSH creds (dev)
     host = os.environ.get("INSTALLER_VM_HOST", "").strip()
     password = os.environ.get("INSTALLER_VM_PASSWORD", "").strip()
     if not host or not password:
@@ -145,11 +145,51 @@ def _is_install_running_for_cluster(ps_output: str, cluster_name: str) -> bool:
 
 
 # ---------------------------
+# Cert bundle lookup on VM
+# ---------------------------
+
+_cert_cache: Dict[str, Tuple[float, bool]] = {}
+
+
+def _cert_zip_path_for_cluster(cluster_name: str) -> str:
+    base_dir = os.environ.get("INSTALLER_BASE_DIR", "/home/devops").rstrip("/")
+    # IMPORTANT: do NOT inject "-openshift" here
+    cluster_dir = f"az-{cluster_name}-cluster"
+    return f"{base_dir}/{cluster_dir}/certs/certs.zip"
+
+
+def _has_cert_zip_on_vm(cluster_name: str, ttl_seconds: int = 20) -> bool:
+    now = time.time()
+    cached = _cert_cache.get(cluster_name)
+    if cached and (now - cached[0]) < ttl_seconds:
+        return cached[1]
+
+    host = os.environ.get("INSTALLER_VM_HOST", "").strip()
+    password = os.environ.get("INSTALLER_VM_PASSWORD", "").strip()
+    if not host or not password:
+        _cert_cache[cluster_name] = (now, False)
+        return False
+
+    user = os.environ.get("INSTALLER_VM_USER", "asgard")
+    zip_path = _cert_zip_path_for_cluster(cluster_name)
+
+    # Use a simple test that returns YES/NO so we can parse reliably
+    cmd = f"bash -lc 'test -f {zip_path!s} && echo YES || echo NO'"
+    try:
+        out = _ssh_exec(host, user, password, cmd, timeout=12)
+        ok = "YES" in (out or "")
+        _cert_cache[cluster_name] = (now, ok)
+        return ok
+    except Exception:
+        _cert_cache[cluster_name] = (now, False)
+        return False
+
+
+# ---------------------------
 # DNS zone lookup
 # ---------------------------
 
 def _list_private_dns_zone_names(zone_subscription: str) -> set:
-    """Fast subscription-wide list (paging) -> lowercase names."""
     pdns = _privatedns_client(zone_subscription)
     names = set()
     for z in pdns.private_zones.list():
@@ -158,7 +198,6 @@ def _list_private_dns_zone_names(zone_subscription: str) -> set:
     return names
 
 
-# per-RG "any zone exists" check (cached)
 _dns_rg_cache: Dict[Tuple[str, str], Tuple[float, bool]] = {}
 
 
@@ -172,7 +211,6 @@ def _rg_has_any_private_dns_zone(subscription_id: str, rg_name: str, ttl_seconds
 
     pdns = _privatedns_client(subscription_id)
     try:
-        # if at least 1 zone exists in RG -> ok
         for _ in pdns.private_zones.list_by_resource_group(rg_name):
             _dns_rg_cache[key] = (now, True)
             return True
@@ -200,12 +238,8 @@ def discover_clusters(
       - "dns": only list DNS zones timing (subscription-wide)
       - "ssh": only SSH ps timing
     """
-
     rclient = _resource_client(cluster_subscription)
 
-    # -----------------------
-    # Debug: RG only (fast)
-    # -----------------------
     if debug == "rg":
         t0 = time.time()
         all_rgs: List[str] = []
@@ -223,11 +257,7 @@ def discover_clusters(
             m = RG_RE.match(rg_name)
             if m:
                 matched.append(
-                    {
-                        "resourceGroup": rg_name,
-                        "clusterName": m.group("name"),
-                        "infra": m.group("infra"),
-                    }
+                    {"resourceGroup": rg_name, "clusterName": m.group("name"), "infra": m.group("infra")}
                 )
 
         return {
@@ -240,9 +270,6 @@ def discover_clusters(
             "elapsedSeconds": round(time.time() - t0, 3),
         }
 
-    # -----------------------
-    # Debug: DNS only
-    # -----------------------
     if debug == "dns":
         t0 = time.time()
         names = _list_private_dns_zone_names(zone_subscription)
@@ -254,9 +281,6 @@ def discover_clusters(
             "elapsedSeconds": round(time.time() - t0, 3),
         }
 
-    # -----------------------
-    # Debug: SSH only
-    # -----------------------
     if debug == "ssh":
         t0 = time.time()
         try:
@@ -276,10 +300,6 @@ def discover_clusters(
             "elapsedSeconds": round(time.time() - t0, 3),
         }
 
-    # -----------------------
-    # Normal mode: ONLY RUNNING
-    # -----------------------
-
     cache_ttl = int(os.environ.get("DISCOVER_CLUSTERS_CACHE_TTL", "20"))
     dns_suffix = os.environ.get("DNS_ZONE_SUFFIX", "").strip()
 
@@ -291,13 +311,11 @@ def discover_clusters(
         if data and (now - ts) < cache_ttl:
             return data
 
-    # SSH optional (we no longer use it for status, but keep it for future debug)
     try:
         ps_out = _installer_processes_cached(ttl_seconds=10)
     except Exception:
         ps_out = ""
 
-    # subscription DNS names once (fallback)
     try:
         dns_zone_names = _list_private_dns_zone_names(zone_subscription)
     except Exception:
@@ -310,7 +328,6 @@ def discover_clusters(
         if not rg_name:
             continue
 
-        # enforce lowercase RGs only
         if rg_name != rg_name.lower():
             continue
 
@@ -323,16 +340,17 @@ def discover_clusters(
 
         zone_name = f"{cluster_name}{dns_suffix}.{base_domain}"
 
-        # your rule: any zone in same RG == OK
         dns_found = _rg_has_any_private_dns_zone(zone_subscription, rg_name)
-
-        # fallback: exact zone name exists in subscription
         if not dns_found and dns_zone_names:
             dns_found = zone_name.lower() in dns_zone_names
 
-        # ✅ ONLY INCLUDE RUNNING CLUSTERS
+        # Only include running clusters
         if not dns_found:
             continue
+
+        # NEW: check cert zip presence on VM
+        cert_zip_path = _cert_zip_path_for_cluster(cluster_name)
+        cert_zip_found = _has_cert_zip_on_vm(cluster_name, ttl_seconds=20)
 
         out.append(
             DiscoveredCluster(
@@ -344,6 +362,8 @@ def discover_clusters(
                 status="running",
                 dns_zone=zone_name,
                 dns_zone_found=True,
+                cert_zip_found=cert_zip_found,
+                cert_zip_path=cert_zip_path,
             ).to_dict()
         )
 

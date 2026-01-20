@@ -33,8 +33,7 @@ export function CreateClusterForm() {
   const finalClusterName = useMemo(() => {
     const trimmed = name.trim();
     if (!trimmed) return '';
-    const lower = trimmed.toLowerCase();
-    return lower.endsWith('-openshift') ? lower : `${lower}-openshift`;
+    return trimmed.toLowerCase();
   }, [name]);
 
   const onChangeName = (v: string) => {

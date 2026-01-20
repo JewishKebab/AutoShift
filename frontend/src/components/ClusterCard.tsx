@@ -1,7 +1,9 @@
+// ClusterCard.tsx
+import { useState } from 'react';
 import { ClusterStatusBadge } from './ClusterStatusBadge';
 import { Card, CardContent, CardHeader } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
-import { Server, HardDrive, MapPin, Calendar, Trash2, ExternalLink } from 'lucide-react';
+import { Server, HardDrive, MapPin, Calendar, Trash2, ExternalLink, Download, Loader2 } from 'lucide-react';
 import { useClusters } from '@/contexts/ClusterContext';
 import { formatDistanceToNow } from 'date-fns';
 import {
@@ -16,13 +18,11 @@ import {
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog';
 
-// Accept both your "old" Cluster shape and the new Azure-discovery shape.
 type AnyCluster = {
   id: string;
   name: string;
   status: string;
 
-  // old/local fields (optional)
   baseDomain?: string;
   masterNodeSize?: string;
   workerNodeSize?: string;
@@ -31,7 +31,6 @@ type AnyCluster = {
   region?: string;
   createdAt?: any;
 
-  // azure fields (optional)
   resourceGroup?: string;
   infra?: string;
   subscriptionId?: string;
@@ -45,7 +44,6 @@ interface ClusterCardProps {
 
 function vmFamily(size?: string) {
   if (!size) return '—';
-  // your old code: "Standard_D8s_v3" -> "D8s" (index 1)
   const parts = size.split('_');
   return parts[1] ?? size;
 }
@@ -61,14 +59,31 @@ function safeCreatedText(createdAt: any) {
   }
 }
 
+// ---- IMPORTANT: matches your Flask routes ----
+async function apiCertExists(clusterName: string): Promise<boolean> {
+  const url = `/api/installer/certs/exists/${encodeURIComponent(clusterName)}`;
+  const r = await fetch(url, { method: 'GET', headers: { Accept: 'application/json' } });
+  if (!r.ok) return false;
+  const j = await r.json().catch(() => ({} as any));
+  return Boolean(j?.exists);
+}
+
+function apiDownloadCert(clusterName: string) {
+  const url = `/api/installer/certs/by-cluster/${encodeURIComponent(clusterName)}`;
+  window.location.href = url;
+}
+
 export function ClusterCard({ cluster }: ClusterCardProps) {
   const ctx = useClusters() as any;
-
-  // deleteCluster might exist only in your old flow. Keep safe.
   const deleteCluster: undefined | ((id: string) => void) = ctx?.deleteCluster;
 
+  const [certMsg, setCertMsg] = useState<string | null>(null);
+  const [certBusy, setCertBusy] = useState(false);
+
   const isDeleting = cluster.status === 'deleting';
-  const canDelete = (cluster.status === 'running' || cluster.status === 'failed') && typeof deleteCluster === 'function';
+  const canDelete =
+    (cluster.status === 'running' || cluster.status === 'failed') &&
+    typeof deleteCluster === 'function';
 
   const hasSizing =
     typeof cluster.masterReplicas === 'number' &&
@@ -77,6 +92,32 @@ export function ClusterCard({ cluster }: ClusterCardProps) {
     typeof cluster.workerNodeSize === 'string';
 
   const createdText = safeCreatedText(cluster.createdAt);
+  const isRunning = cluster.status === 'running';
+
+  const flashMsg = (m: string) => {
+    setCertMsg(m);
+    window.setTimeout(() => setCertMsg(null), 2500);
+  };
+
+  const onCertClick = async () => {
+    if (!isRunning || certBusy) return;
+
+    setCertBusy(true);
+    setCertMsg(null);
+
+    try {
+      const exists = await apiCertExists(cluster.name);
+      if (!exists) {
+        flashMsg('No cert found');
+        return;
+      }
+      apiDownloadCert(cluster.name);
+    } catch {
+      flashMsg('No cert found');
+    } finally {
+      setCertBusy(false);
+    }
+  };
 
   return (
     <Card className="animate-fade-in transition-all hover:shadow-lg hover:shadow-primary/5 border-border/50">
@@ -86,8 +127,6 @@ export function ClusterCard({ cluster }: ClusterCardProps) {
             <h3 className="font-display font-semibold text-lg leading-none tracking-tight">
               {cluster.name}
             </h3>
-
-            {/* Prefer baseDomain if present, else show dnsZone (azure), else show resourceGroup */}
             <p className="text-sm text-muted-foreground">
               {cluster.baseDomain ?? cluster.dnsZone ?? cluster.resourceGroup ?? ''}
             </p>
@@ -97,7 +136,6 @@ export function ClusterCard({ cluster }: ClusterCardProps) {
       </CardHeader>
 
       <CardContent className="space-y-4">
-        {/* OLD/local cluster view */}
         {hasSizing ? (
           <div className="grid grid-cols-2 gap-4 text-sm">
             <div className="flex items-center gap-2 text-muted-foreground">
@@ -112,19 +150,16 @@ export function ClusterCard({ cluster }: ClusterCardProps) {
                 Worker: {cluster.workerReplicas}x {vmFamily(cluster.workerNodeSize)}
               </span>
             </div>
-
             <div className="flex items-center gap-2 text-muted-foreground">
               <MapPin className="h-4 w-4 text-primary" />
               <span className="capitalize">{cluster.region ?? '—'}</span>
             </div>
-
             <div className="flex items-center gap-2 text-muted-foreground">
               <Calendar className="h-4 w-4 text-primary" />
               <span>{createdText ?? '—'}</span>
             </div>
           </div>
         ) : (
-          /* AZURE discovery view */
           <div className="grid grid-cols-2 gap-4 text-sm">
             <div className="flex items-center gap-2 text-muted-foreground">
               <Server className="h-4 w-4 text-primary" />
@@ -148,12 +183,30 @@ export function ClusterCard({ cluster }: ClusterCardProps) {
           </div>
         )}
 
-        <div className="flex gap-2 pt-2">
-          {cluster.status === 'running' && (
+        <div className="flex flex-wrap gap-2 pt-2 items-center">
+          {isRunning && (
             <Button variant="outline" size="sm" className="flex-1 gap-2">
               <ExternalLink className="h-4 w-4" />
               Open Console
             </Button>
+          )}
+
+          {isRunning && (
+            <div className="flex items-center gap-2">
+              <Button
+                variant="secondary"
+                size="sm"
+                className="gap-2"
+                onClick={onCertClick}
+                disabled={certBusy}
+                title="Checks installer VM for certs.zip and downloads it"
+              >
+                {certBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                Certificate
+              </Button>
+
+              {certMsg && <span className="text-xs text-muted-foreground">{certMsg}</span>}
+            </div>
           )}
 
           {canDelete && (

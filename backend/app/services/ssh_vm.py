@@ -170,3 +170,12 @@ def ensure_install_config_on_vm(*, cluster_name: str, install_config_yaml: str) 
             client.close()
         except Exception:
             pass
+
+
+
+def connect_ssh() -> paramiko.SSHClient:
+    """
+    Public wrapper around the internal retrying connector.
+    Routes/services should use this instead of importing _connect directly.
+    """
+    return _connect()
