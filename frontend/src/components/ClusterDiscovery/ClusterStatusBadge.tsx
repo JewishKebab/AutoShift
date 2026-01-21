@@ -1,14 +1,14 @@
-import { ClusterStatus } from '@/types/azureCluster';
+import { AzureClusterStatus } from '@/types/azureCluster';
 import { Badge } from '@/components/ui/badge';
 import { Loader2, CheckCircle2, XCircle, Clock, Trash2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 interface ClusterStatusBadgeProps {
-  status: ClusterStatus;
+  status: AzureClusterStatus;
   className?: string;
 }
 
-const statusConfig: Record<ClusterStatus, { 
+const statusConfig: Record<AzureClusterStatus, { 
   label: string; 
   icon: React.ElementType;
   variant: 'default' | 'secondary' | 'destructive' | 'outline';
@@ -25,12 +25,6 @@ const statusConfig: Record<ClusterStatus, {
     icon: Loader2,
     variant: 'secondary',
     className: 'bg-warning text-warning-foreground hover:bg-warning/90',
-  },
-  deleting: {
-    label: 'Deleting',
-    icon: Trash2,
-    variant: 'destructive',
-    className: 'bg-destructive text-destructive-foreground',
   },
   failed: {
     label: 'Failed',

@@ -16,6 +16,16 @@ from azure.mgmt.privatedns import PrivateDnsManagementClient
 RG_RE = re.compile(r"^(?P<name>[a-z0-9-]*opensh[a-z0-9-]*)-(?P<infra>[a-z0-9]{5})-rg$")
 
 
+def _openshift_console_url_from_dns_zone(dns_zone: str) -> str:
+    """
+    OpenShift console URL pattern:
+      https://console-openshift-console.apps.<dns_zone>/
+    """
+    z = (dns_zone or "").strip().rstrip(".")
+    scheme = os.environ.get("OPENSHIFT_CONSOLE_SCHEME", "https").strip() or "https"
+    return f"{scheme}://console-openshift-console.apps.{z}/"
+
+
 @dataclass
 class DiscoveredCluster:
     id: str
@@ -24,12 +34,17 @@ class DiscoveredCluster:
     resource_group: str
     subscription_id: str
     status: str
+
+    # Real DNS zone read from Azure (Private DNS Zone name)
     dns_zone: str
     dns_zone_found: bool
 
-    # NEW: cert bundle presence on installer VM
+    # Cert bundle presence on installer VM
     cert_zip_found: bool = False
     cert_zip_path: str = ""
+
+    # OpenShift web console URL
+    openshift_console_url: str = ""
 
     def to_dict(self) -> Dict:
         return {
@@ -43,6 +58,7 @@ class DiscoveredCluster:
             "dnsZoneFound": self.dns_zone_found,
             "certZipFound": self.cert_zip_found,
             "certZipPath": self.cert_zip_path,
+            "openshiftConsoleUrl": self.openshift_console_url,
         }
 
 
@@ -55,7 +71,7 @@ _resource_clients: Dict[str, ResourceManagementClient] = {}
 _privatedns_clients: Dict[str, PrivateDnsManagementClient] = {}
 
 # Cache for discover_clusters results
-_discover_cache: Dict[Tuple[str, str, str, str], Tuple[float, List[Dict]]] = {}
+_discover_cache: Dict[Tuple[str, str, str], Tuple[float, List[Dict]]] = {}
 
 
 def _get_credential() -> ClientSecretCredential:
@@ -173,7 +189,6 @@ def _has_cert_zip_on_vm(cluster_name: str, ttl_seconds: int = 20) -> bool:
     user = os.environ.get("INSTALLER_VM_USER", "asgard")
     zip_path = _cert_zip_path_for_cluster(cluster_name)
 
-    # Use a simple test that returns YES/NO so we can parse reliably
     cmd = f"bash -lc 'test -f {zip_path!s} && echo YES || echo NO'"
     try:
         out = _ssh_exec(host, user, password, cmd, timeout=12)
@@ -186,39 +201,52 @@ def _has_cert_zip_on_vm(cluster_name: str, ttl_seconds: int = 20) -> bool:
 
 
 # ---------------------------
-# DNS zone lookup
+# DNS zone lookup (REAL RG data)
 # ---------------------------
 
-def _list_private_dns_zone_names(zone_subscription: str) -> set:
-    pdns = _privatedns_client(zone_subscription)
-    names = set()
-    for z in pdns.private_zones.list():
-        if z.name:
-            names.add(z.name.lower())
-    return names
+_dns_name_cache: Dict[Tuple[str, str], Tuple[float, Optional[str]]] = {}
 
 
-_dns_rg_cache: Dict[Tuple[str, str], Tuple[float, bool]] = {}
-
-
-def _rg_has_any_private_dns_zone(subscription_id: str, rg_name: str, ttl_seconds: int = 60) -> bool:
+def _get_dns_zone_from_rg(subscription_id: str, rg_name: str, ttl_seconds: int = 60) -> Optional[str]:
+    """
+    Return a Private DNS zone name found inside the resource group (exact Azure truth).
+    If multiple zones exist, prefer one that ends with OCP_BASE_DOMAIN if set.
+    """
     key = (subscription_id, rg_name)
     now = time.time()
 
-    cached = _dns_rg_cache.get(key)
+    cached = _dns_name_cache.get(key)
     if cached and (now - cached[0]) < ttl_seconds:
         return cached[1]
 
     pdns = _privatedns_client(subscription_id)
+    base_domain = (os.environ.get("OCP_BASE_DOMAIN") or "").strip().lower()
+
+    zones: List[str] = []
     try:
-        for _ in pdns.private_zones.list_by_resource_group(rg_name):
-            _dns_rg_cache[key] = (now, True)
-            return True
-        _dns_rg_cache[key] = (now, False)
-        return False
+        for z in pdns.private_zones.list_by_resource_group(rg_name):
+            if z.name:
+                zones.append(z.name.strip().lower())
     except Exception:
-        _dns_rg_cache[key] = (now, False)
-        return False
+        _dns_name_cache[key] = (now, None)
+        return None
+
+    if not zones:
+        _dns_name_cache[key] = (now, None)
+        return None
+
+    # Prefer a zone that matches your base domain (if configured)
+    if base_domain:
+        preferred = [z for z in zones if z.endswith("." + base_domain) or z == base_domain]
+        if preferred:
+            chosen = sorted(preferred, key=len, reverse=True)[0]
+            _dns_name_cache[key] = (now, chosen)
+            return chosen
+
+    # Otherwise choose the longest (usually most specific)
+    chosen = sorted(zones, key=len, reverse=True)[0]
+    _dns_name_cache[key] = (now, chosen)
+    return chosen
 
 
 # ---------------------------
@@ -235,7 +263,6 @@ def discover_clusters(
     debug:
       - None: normal mode -> List[Dict]
       - "rg": only list RGs + matches (no DNS, no SSH)
-      - "dns": only list DNS zones timing (subscription-wide)
       - "ssh": only SSH ps timing
     """
     rclient = _resource_client(cluster_subscription)
@@ -270,17 +297,6 @@ def discover_clusters(
             "elapsedSeconds": round(time.time() - t0, 3),
         }
 
-    if debug == "dns":
-        t0 = time.time()
-        names = _list_private_dns_zone_names(zone_subscription)
-        return {
-            "debugMode": "dns",
-            "zoneSubscription": zone_subscription,
-            "count": len(names),
-            "sample": sorted(list(names))[:50],
-            "elapsedSeconds": round(time.time() - t0, 3),
-        }
-
     if debug == "ssh":
         t0 = time.time()
         try:
@@ -301,9 +317,8 @@ def discover_clusters(
         }
 
     cache_ttl = int(os.environ.get("DISCOVER_CLUSTERS_CACHE_TTL", "20"))
-    dns_suffix = os.environ.get("DNS_ZONE_SUFFIX", "").strip()
+    cache_key = (cluster_subscription, zone_subscription, base_domain)
 
-    cache_key = (cluster_subscription, zone_subscription, base_domain, dns_suffix)
     now = time.time()
     cached = _discover_cache.get(cache_key)
     if cached:
@@ -315,11 +330,6 @@ def discover_clusters(
         ps_out = _installer_processes_cached(ttl_seconds=10)
     except Exception:
         ps_out = ""
-
-    try:
-        dns_zone_names = _list_private_dns_zone_names(zone_subscription)
-    except Exception:
-        dns_zone_names = set()
 
     out: List[Dict] = []
 
@@ -338,19 +348,16 @@ def discover_clusters(
         cluster_name = m.group("name")
         infra = m.group("infra")
 
-        zone_name = f"{cluster_name}{dns_suffix}.{base_domain}"
-
-        dns_found = _rg_has_any_private_dns_zone(zone_subscription, rg_name)
-        if not dns_found and dns_zone_names:
-            dns_found = zone_name.lower() in dns_zone_names
-
-        # Only include running clusters
-        if not dns_found:
+        # ✅ REAL DNS: read from Private DNS Zones in this RG (zone_subscription)
+        zone_name = _get_dns_zone_from_rg(zone_subscription, rg_name, ttl_seconds=60)
+        if not zone_name:
+            # Only include running clusters (those with DNS zone present)
             continue
 
-        # NEW: check cert zip presence on VM
         cert_zip_path = _cert_zip_path_for_cluster(cluster_name)
         cert_zip_found = _has_cert_zip_on_vm(cluster_name, ttl_seconds=20)
+
+        console_url = _openshift_console_url_from_dns_zone(zone_name)
 
         out.append(
             DiscoveredCluster(
@@ -364,6 +371,7 @@ def discover_clusters(
                 dns_zone_found=True,
                 cert_zip_found=cert_zip_found,
                 cert_zip_path=cert_zip_path,
+                openshift_console_url=console_url,
             ).to_dict()
         )
 

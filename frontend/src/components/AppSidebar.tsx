@@ -4,7 +4,7 @@
   import { useAuth } from '@/contexts/AuthContext';
   import { useClusters } from '@/contexts/ClusterContext';
   import { Button } from '@/components/ui/button';
-  import { ClusterStatusBadge } from './ClusterStatusBadge';
+  import { ClusterStatusBadge } from './ClusterDiscovery/ClusterStatusBadge';
   import { ScrollArea } from '@/components/ui/scroll-area';
 
   const navigation = [

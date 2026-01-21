@@ -2,7 +2,7 @@ import { Routes, Route, Navigate } from 'react-router-dom';
 import { AppSidebar } from '@/components/AppSidebar';
 import { CreateClusterForm } from '@/components/CreateClusterForm/CreateClusterForm';
 import { DeleteClusterPanel } from '@/components/DeleteClusterPanel/DeleteClusterPanel';
-import { ClusterStatusPanel } from '@/components/ClusterStatusPanel';
+import { ClusterStatusPanel } from '@/components/ClusterDiscovery/ClusterStatusPanel';
 import { useAuth } from '@/contexts/AuthContext';
 
 export default function Dashboard() {
